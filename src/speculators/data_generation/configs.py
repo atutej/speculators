@@ -137,6 +137,14 @@ DATASET_CONFIGS: dict[str, DatasetConfig] = {
         split="chat",
         normalize_fn=_normalize_nemotron,
     ),
+    # Multi-turn terminal-agent trajectories (role/content turns, no normalize needed).
+    # Other subsets: skill_based_easy / skill_based_medium / skill_based_mixed.
+    "nemotron-terminal": DatasetConfig(
+        name="nemotron-terminal",
+        hf_path="nvidia/Nemotron-Terminal-Corpus",
+        subset="dataset_adapters",
+        split="train",
+    ),
     # NOTE: You need to serve vLLM with `--allowed-local-media-path /path/to/coco`
     "sharegpt4v_coco": DatasetConfig(
         name="sharegpt4v_coco",
