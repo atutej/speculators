@@ -444,12 +444,21 @@ def _save_vllm_provenance(
 
 
 def _build_train_cmd(args, vllm_args):
-    from transformers import AutoConfig  # noqa: PLC0415
+    from transformers import AutoConfig, PretrainedConfig  # noqa: PLC0415
 
-    config = AutoConfig.from_pretrained(
-        args.model,
-        trust_remote_code=args.trust_remote_code,
-    )
+    try:
+        config = AutoConfig.from_pretrained(
+            args.model,
+            trust_remote_code=args.trust_remote_code,
+        )
+    except ValueError:
+        # A model type this Transformers does not know (e.g. Grug's `grug_moe`, which ships no config
+        # code): only the layer count is needed here, so read it from config.json. vLLM resolves its
+        # own config for serving.
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            args.model, trust_remote_code=args.trust_remote_code
+        )
+        config = PretrainedConfig(**config_dict)
     if hasattr(config, "text_config"):
         config = config.text_config
     num_hidden_layers = config.num_hidden_layers
