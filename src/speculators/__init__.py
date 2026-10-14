@@ -20,7 +20,11 @@ The library offers a modular architecture with components for:
   algorithms.
 """
 
-from .config import (
+from .utils.hf_configs import register_verifier_configs
+
+register_verifier_configs()
+
+from .config import (  # noqa: E402
     SpeculatorModelConfig,
     SpeculatorsConfig,
     VerifierConfig,

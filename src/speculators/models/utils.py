@@ -192,3 +192,32 @@ def resolve_draft_intermediate_size(verifier_config: PretrainedConfig) -> int:
         stacklevel=3,
     )
     return intermediate_size
+
+
+# Verifier architectures whose lm_head input is gated after the final norm:
+# logits = lm_head(norm(h) * sigmoid(up(silu(down(norm(h)))))). Every other verifier is untouched.
+GATED_VERIFIER_ARCHITECTURES: frozenset[str] = frozenset({"GrugMoeForCausalLM"})
+GATED_VERIFIER_MODEL_TYPES: frozenset[str] = frozenset({"grug_moe"})
+GATED_VERIFIER_WEIGHT_NAMES: tuple[str, str] = (
+    "model.final_gated_norm.down_proj.weight",
+    "model.final_gated_norm.up_proj.weight",
+)
+
+
+def uses_gated_verifier_head(
+    architectures: "list[str] | None", model_type: "str | None" = None
+) -> bool:
+    return bool(GATED_VERIFIER_ARCHITECTURES.intersection(architectures or [])) or (
+        model_type in GATED_VERIFIER_MODEL_TYPES
+    )
+
+
+def apply_verifier_gate(
+    hidden_states: torch.Tensor, down_weight: torch.Tensor, up_weight: torch.Tensor
+) -> torch.Tensor:
+    # The checkpoint stores the gate in bf16; the draft model may run in another dtype or on another device.
+    down_weight = down_weight.to(device=hidden_states.device, dtype=hidden_states.dtype)
+    up_weight = up_weight.to(device=hidden_states.device, dtype=hidden_states.dtype)
+    gate = torch.nn.functional.linear(hidden_states, down_weight)
+    gate = torch.nn.functional.linear(torch.nn.functional.silu(gate), up_weight)
+    return hidden_states * torch.sigmoid(gate)

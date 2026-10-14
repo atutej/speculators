@@ -22,10 +22,13 @@ from speculators.models.dflash.utils import (
     select_anchors,
 )
 from speculators.models.utils import (
+    apply_verifier_gate,
     conditional_torch_compile,
     flatten_rope_parameters,
+    get_verifier_config,
     resolve_target_layer_ids,
     resolve_verifier_norm_class,
+    uses_gated_verifier_head,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,6 +133,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
         self.verifier_norm.weight.requires_grad = False
+        # Gate weights of a Grug verifier (see load_verifier_weights); None, and unused, for every other verifier.
+        self.register_buffer("verifier_gate_down_weight", None, persistent=False)
+        self.register_buffer("verifier_gate_up_weight", None, persistent=False)
         self.block_size = config.block_size
 
         # Warn if using DFlash with sample_from_anchor=True (may not be supported)
@@ -171,6 +177,49 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             overwrite_embed_tokens=True,
             overwrite_lm_head=not self.use_draft_vocab,
         )
+        verifier = getattr(self.config.speculators_config, "verifier", None)
+        architectures = getattr(verifier, "architectures", None)
+        gated = uses_gated_verifier_head(architectures)
+        name_or_path = getattr(verifier, "name_or_path", None)
+        if not gated and not architectures and name_or_path:
+            # A verifier config without `architectures` must not silently skip a gate it needs.
+            try:
+                model_type = get_verifier_config(name_or_path).model_type
+            except Exception:  # noqa: BLE001 - an unreadable config is not a gated verifier
+                model_type = None
+            gated = uses_gated_verifier_head(None, model_type)
+            if gated:
+                logger.warning(
+                    "Verifier config %r has no `architectures`; model_type %r needs the gated final norm, "
+                    "so it is applied.", name_or_path, model_type,
+                )
+        if gated:
+            from speculators.models.utils import GATED_VERIFIER_WEIGHT_NAMES  # noqa: PLC0415
+            from speculators.utils.loading import load_model_layers  # noqa: PLC0415
+
+            down_name, up_name = GATED_VERIFIER_WEIGHT_NAMES
+            weights = load_model_layers([down_name, up_name], name_or_path)  # type: ignore[arg-type]
+            missing = [n for n in (down_name, up_name) if n not in weights]
+            if missing:
+                raise ValueError(f"Gated verifier {name_or_path!r} is missing tensors {missing}")
+            self.verifier_gate_down_weight = weights[down_name]
+            self.verifier_gate_up_weight = weights[up_name]
+            logger.info(
+                "Gated verifier head enabled for %r: gate down %s, up %s; verifier targets = lm_head(gate(norm(h))).",
+                name_or_path, tuple(self.verifier_gate_down_weight.shape), tuple(self.verifier_gate_up_weight.shape),
+            )
+
+    def _verifier_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The verifier's logits for its last hidden states (the training targets).
+
+        Final norm, then, only for a verifier whose gate weights were loaded (Grug), its gated final norm, then lm_head.
+        """
+        hidden_states = self.verifier_norm(hidden_states)
+        if self.verifier_gate_down_weight is not None:
+            hidden_states = apply_verifier_gate(
+                hidden_states, self.verifier_gate_down_weight, self.verifier_gate_up_weight
+            )
+        return self.verifier_lm_head(hidden_states)
 
     @classmethod
     def from_training_args(
@@ -437,13 +486,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                     if self.config.sample_from_anchor
                     else (anchored_block_indices - 1) % total_seq_len
                 )
-                targets = self.verifier_lm_head(
-                    self.verifier_norm(verifier_last_hidden_states[:, target_indices])
+                targets = self._verifier_logits(
+                    verifier_last_hidden_states[:, target_indices]
                 )
             else:
-                verifier_logits = self.verifier_lm_head(
-                    self.verifier_norm(verifier_last_hidden_states)
-                )
+                verifier_logits = self._verifier_logits(verifier_last_hidden_states)
                 if not self.config.sample_from_anchor:
                     verifier_logits = torch.roll(verifier_logits, 1, dims=1)
                 targets = verifier_logits[:, anchored_block_indices]
