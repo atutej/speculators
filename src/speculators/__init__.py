@@ -20,14 +20,18 @@ The library offers a modular architecture with components for:
   algorithms.
 """
 
-from .config import (
+from .utils.hf_configs import register_verifier_configs
+
+register_verifier_configs()
+
+from .config import (  # noqa: E402
     SpeculatorModelConfig,
     SpeculatorsConfig,
     VerifierConfig,
     reload_schemas,
 )
-from .model import SpeculatorModel
-from .models import (
+from .model import SpeculatorModel  # noqa: E402
+from .models import (  # noqa: E402
     DFlash2DraftModel,
     DFlash2SpeculatorConfig,
     DFlashDraftModel,
@@ -41,7 +45,7 @@ from .models import (
     PEagleDraftModel,
     PEagleSpeculatorConfig,
 )
-from .proposals import TokenProposalConfig
+from .proposals import TokenProposalConfig  # noqa: E402
 
 __all__ = [
     "DFlash2DraftModel",
