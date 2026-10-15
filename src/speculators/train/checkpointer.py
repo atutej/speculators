@@ -65,16 +65,140 @@ class BaseCheckpointer:
             optimizer_state_dict.pt
             scheduler_state_dict.pt (optional)
         ...
+
+    With ``layout="step"`` the periodic (mid-epoch) and interrupt checkpoints are
+    instead kept as ``checkpoint-<global_step>/`` directories, like the Hugging Face
+    ``Trainer``: each is written to ``checkpoint-<step>.tmp/`` and renamed only once
+    every file is on disk, so a kill never leaves a half-written checkpoint; only the
+    newest ``save_total_limit`` are kept (plus optional milestones). End-of-epoch
+    checkpoints stay in the ``<epoch>/`` directories. Resume takes whichever complete
+    checkpoint has the highest ``global_step`` in its ``training_state.json``.
     """
 
-    def __init__(self, path: Path | str):
+    STEP_PREFIX = "checkpoint-"
+    TMP_SUFFIX = ".tmp"
+    TRAINING_STATE_FILENAME = "training_state.json"
+
+    def __init__(self, path: Path | str, layout: str = "epoch"):
+        if layout not in ("epoch", "step"):
+            raise ValueError(f"layout must be 'epoch' or 'step', got {layout!r}")
         self.path = Path(path)
+        self.layout = layout
         self.previous_epoch = self._get_previous_epoch()
+        # Name of the directory (inside ``path``) that the load_* methods read.
+        self._resume_name: str | None = None
+
+        if layout == "step":
+            self._resolve_step_resume()
 
         if self.previous_epoch != -1:
-            self.prev_path: Path | None = self.path / str(self.previous_epoch)
+            self.prev_path: Path | None = self.path / self.load_name
         else:
             self.prev_path = None
+
+    @property
+    def load_name(self) -> str:
+        """Directory name that resume reads from (an epoch number or checkpoint-N)."""
+        if self._resume_name is not None:
+            return self._resume_name
+        return str(self.previous_epoch)
+
+    # ------------------------------------------------------------------ step layout
+    def read_training_state(self, name: str) -> dict:
+        """Return ``training_state.json`` of a checkpoint directory ({} if unreadable)."""
+        p = self.path / name / self.TRAINING_STATE_FILENAME
+        try:
+            return json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _is_complete(self, name: str) -> bool:
+        d = self.path / name
+        return (
+            d.is_dir()
+            and not d.is_symlink()
+            and (d / "model.safetensors").exists()
+            and (d / "optimizer_state_dict.pt").exists()
+            and (d / self.TRAINING_STATE_FILENAME).exists()
+        )
+
+    def list_step_checkpoints(self) -> list[tuple[int, Path]]:
+        """Complete ``checkpoint-<step>`` directories, oldest first."""
+        found: list[tuple[int, Path]] = []
+        if not self.path.exists():
+            return found
+        for d in self.path.iterdir():
+            name = d.name
+            if not name.startswith(self.STEP_PREFIX) or name.endswith(self.TMP_SUFFIX):
+                continue
+            try:
+                step = int(name[len(self.STEP_PREFIX) :])
+            except ValueError:
+                continue
+            if self._is_complete(name):
+                found.append((step, d))
+        return sorted(found)
+
+    def _resolve_step_resume(self) -> None:
+        """Pick the complete checkpoint with the highest global_step to resume from."""
+        best_step = -2  # an epoch dir without training state still counts, as before
+        best_name: str | None = None
+        best_epoch = self.previous_epoch
+        for step, d in self.list_step_checkpoints():
+            state = self.read_training_state(d.name)
+            if step > best_step:
+                best_step, best_name = step, d.name
+                best_epoch = int(state.get("epoch", 0))
+        if self.previous_epoch != -1:
+            state = self.read_training_state(str(self.previous_epoch))
+            epoch_step = int(state.get("global_step", -1))
+            if best_name is None or epoch_step >= best_step:
+                return  # the newest epoch-end checkpoint wins: keep the legacy path
+        if best_name is not None:
+            self._resume_name = best_name
+            self.previous_epoch = best_epoch
+
+    @_rank0_only
+    def prepare_step_tmp(self, tmp_name: str) -> None:
+        """Remove a leftover temporary directory from a save that was killed."""
+        stale = self.path / tmp_name
+        if stale.exists():
+            shutil.rmtree(stale)
+
+    @_rank0_only
+    def finalize_step_checkpoint(
+        self,
+        tmp_name: str,
+        final_name: str,
+        save_total_limit: int,
+        keep_every_steps: int = 0,
+    ) -> None:
+        """Atomically publish ``tmp_name`` as ``final_name``, then prune old ones."""
+        tmp, final = self.path / tmp_name, self.path / final_name
+        if not tmp.is_dir():
+            raise FileNotFoundError(f"temporary checkpoint {tmp} does not exist")
+        old = None
+        if final.exists():  # the same step saved again: swap, then drop the old copy
+            old = self.path / (final_name + ".old")
+            if old.exists():
+                shutil.rmtree(old)
+            final.rename(old)
+        tmp.rename(final)
+        if old is not None:
+            shutil.rmtree(old, ignore_errors=True)
+        self._prune_step_checkpoints(save_total_limit, keep_every_steps)
+
+    def _prune_step_checkpoints(self, save_total_limit: int, keep_every_steps: int):
+        if save_total_limit <= 0:
+            return  # keep everything
+        steps = self.list_step_checkpoints()
+        keep = {d for _, d in steps[-save_total_limit:]}
+        for step, d in steps:
+            if d in keep or (keep_every_steps > 0 and step % keep_every_steps == 0):
+                continue
+            shutil.rmtree(d, ignore_errors=True)
+        for stale in self.path.glob(f"{self.STEP_PREFIX}*{self.TMP_SUFFIX}"):
+            shutil.rmtree(stale, ignore_errors=True)
 
     @abstractmethod
     def load_model_state_dict(
@@ -92,7 +216,7 @@ class BaseCheckpointer:
         raise NotImplementedError
 
     def load_scheduler_state_dict(self, scheduler: SchedulerOrList):
-        scheduler_path = self.scheduler_path(self.previous_epoch)
+        scheduler_path = self.scheduler_path(self.load_name)
         if not scheduler_path.exists():
             return
         loaded = torch.load(scheduler_path, weights_only=True)
@@ -206,12 +330,13 @@ class BaseCheckpointer:
         self, model: PreTrainedModel, epoch: int, float_dtype: torch.dtype | None = None
     ):
         """Temporarily load weights for a specific epoch."""
-        old_epoch = self.previous_epoch
+        old_epoch, old_name = self.previous_epoch, self._resume_name
         try:
             self.previous_epoch = epoch
+            self._resume_name = None  # read <epoch>/, not the step checkpoint
             self.load_model_state_dict(model, float_dtype=float_dtype)
         finally:
-            self.previous_epoch = old_epoch
+            self.previous_epoch, self._resume_name = old_epoch, old_name
 
     @_rank0_only
     def update_best_symlink(self, epoch: int):
@@ -305,7 +430,7 @@ class SingleGPUCheckpointer(BaseCheckpointer):
     ):
         device = get_current_device()
         full_state_dict = load_safetensors_state_dict(
-            self.model_path(self.previous_epoch),
+            self.model_path(self.load_name),
             device,
         )
         full_state_dict = convert_float_dtype(
@@ -322,7 +447,7 @@ class SingleGPUCheckpointer(BaseCheckpointer):
     ):
         device = get_current_device()
         loaded = torch.load(
-            self.optimizer_path(self.previous_epoch),
+            self.optimizer_path(self.load_name),
             weights_only=True,
             map_location=device,
         )
@@ -365,7 +490,7 @@ class DistributedCheckpointer(BaseCheckpointer):
         self, model: PreTrainedModel, float_dtype: torch.dtype | None = None
     ):
         full_state_dict = load_safetensors_state_dict(
-            self.model_path(self.previous_epoch), "cpu"
+            self.model_path(self.load_name), "cpu"
         )
         full_state_dict = convert_float_dtype(
             full_state_dict, float_dtype or model.dtype
@@ -389,7 +514,7 @@ class DistributedCheckpointer(BaseCheckpointer):
     ):
         optimizers = _as_list(optimizer)
         full_state_dict = torch.load(
-            self.optimizer_path(self.previous_epoch),
+            self.optimizer_path(self.load_name),
             mmap=True,
             weights_only=True,
             map_location="cpu",

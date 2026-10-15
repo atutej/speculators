@@ -148,6 +148,11 @@ class TrainerConfig(NamedTuple):
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
     checkpoint_freq: float = 1
+    # "epoch": periodic checkpoints overwrite <epoch>/ in place (legacy). "step": they
+    # go to checkpoint-<global_step>/, written atomically, newest save_total_limit kept.
+    checkpoint_layout: Literal["epoch", "step"] = "epoch"
+    save_total_limit: int = 3
+    keep_checkpoint_every_steps: int = 0
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
@@ -221,29 +226,36 @@ class Trainer:
             if self.is_distributed and config.fsdp_shard
             else SingleGPUCheckpointer
         )
-        self.checkpointer: BaseCheckpointer = checkpointer_class(self.config.save_path)
+        self.checkpointer: BaseCheckpointer = checkpointer_class(
+            self.config.save_path, layout=self.config.checkpoint_layout
+        )
+        # Last completed (epoch, local step): lets an interrupt save be resumable.
+        self._cur_epoch: int | None = None
+        self._cur_local_step: int | None = None
 
         self.setup_trainer()
         self.setup_model()
         self.setup_optimizer()
 
-    def _training_state_path(self, epoch: int) -> Path:
-        return self.checkpointer.path / str(epoch) / "training_state.json"
+    def _training_state_path(self, name: int | str) -> Path:
+        return self.checkpointer.path / str(name) / "training_state.json"
 
-    def _save_training_state(self, epoch: int, local_step: int) -> None:
+    def _save_training_state(
+        self, epoch: int, local_step: int, name: int | str | None = None
+    ) -> None:
+        """Write training_state.json into checkpoint dir ``name`` (default: <epoch>)."""
         if not self.is_distributed or dist.get_rank() == 0:
             state = {
                 "epoch": epoch,
                 "local_step": local_step,
                 "global_step": self.global_step,
             }
-            p = self._training_state_path(epoch)
+            p = self._training_state_path(epoch if name is None else name)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(state))
 
     def _load_training_state(self) -> dict:
-        epoch = self.checkpointer.previous_epoch
-        p = self._training_state_path(epoch)
+        p = self._training_state_path(self.checkpointer.load_name)
         if p.exists():
             try:
                 return json.loads(p.read_text())
@@ -577,6 +589,7 @@ class Trainer:
                     extra={"step": self.global_step},
                 )
             self.global_step += 1
+            self._cur_epoch, self._cur_local_step = epoch, local_step
 
             if (
                 self.config.max_steps is not None
@@ -666,6 +679,11 @@ class Trainer:
         ):
             return
 
+        if self.config.checkpoint_layout == "step" and self._save_step_checkpoint(
+            epoch, local_step
+        ):
+            return
+
         root_logger.info(f"Saving checkpoint to {self.checkpointer.path / str(epoch)}")
         self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
         if self.schedulers:
@@ -685,6 +703,46 @@ class Trainer:
                         old.unlink()
                 link_name.symlink_to(target)
         root_logger.info(f"Checkpoint saved to {self.checkpointer.path / str(epoch)}")
+
+    def _save_step_checkpoint(self, epoch: int | str, local_step: int) -> bool:
+        """Save ``checkpoint-<global_step>/`` atomically (layout="step").
+
+        Handles mid-epoch saves (``epoch`` is an int and ``local_step > 0``) and the
+        interrupt save (``epoch == "interrupted"``, using the last completed step).
+        Returns False when the save is not a step checkpoint (end of epoch, or an
+        interrupt before any step completed): the caller then uses the epoch layout.
+        """
+        if epoch == "interrupted":
+            if self._cur_epoch is None or self._cur_local_step is None:
+                return False
+            epoch_idx, local_step = self._cur_epoch, self._cur_local_step
+        elif isinstance(epoch, int) and local_step > 0:
+            epoch_idx = epoch
+        else:
+            return False
+
+        final_name = f"{self.checkpointer.STEP_PREFIX}{self.global_step}"
+        tmp_name = final_name + self.checkpointer.TMP_SUFFIX
+        root_logger.info(
+            f"Saving step checkpoint {final_name} (epoch={epoch_idx}, "
+            f"local_step={local_step}) via {tmp_name}"
+        )
+        self.checkpointer.prepare_step_tmp(tmp_name)
+        self.checkpointer.save_checkpoint(self.model, self.optimizers, tmp_name)
+        if self.schedulers:
+            self.checkpointer.save_scheduler_state_dict(self.schedulers, tmp_name)
+        # training_state.json is written last: a directory that has it is complete.
+        self._save_training_state(epoch_idx, local_step, name=tmp_name)
+        if self.is_distributed:
+            dist.barrier()
+        self.checkpointer.finalize_step_checkpoint(
+            tmp_name,
+            final_name,
+            self.config.save_total_limit,
+            self.config.keep_checkpoint_every_steps,
+        )
+        root_logger.info(f"Step checkpoint saved to {self.checkpointer.path / final_name}")
+        return True
 
     def maybe_update_best(self, epoch: int, val_metrics: dict | None):
         if val_metrics is None or "loss_epoch" not in val_metrics:

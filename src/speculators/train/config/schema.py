@@ -396,6 +396,24 @@ class TrainerArgs(_Group):
         description="Save a checkpoint every N epochs. Values < 1 enable sub-epoch "
         "checkpointing (e.g. 0.5 = every half epoch).",
     )
+    checkpoint_layout: Literal["epoch", "step"] = Field(
+        default="epoch",
+        description="How periodic (sub-epoch) and interrupt checkpoints are stored. "
+        "'epoch' (default): overwrite <epoch>/ in place. 'step': Hugging Face style "
+        "checkpoint-<global_step>/ directories, written atomically (a temporary "
+        "directory renamed when complete), newest --save-total-limit kept; resume "
+        "takes the newest complete one. End-of-epoch checkpoints stay in <epoch>/.",
+    )
+    save_total_limit: int = Field(
+        default=3,
+        description="With --checkpoint-layout step: keep only the newest N "
+        "checkpoint-<step>/ directories (0 keeps all).",
+    )
+    keep_checkpoint_every_steps: int = Field(
+        default=0,
+        description="With --checkpoint-layout step: never delete a checkpoint whose "
+        "global step is a multiple of N (milestones to evaluate later; 0 disables).",
+    )
     save_best: bool = Field(
         default=False,
         description="Also point a checkpoint at the lowest validation loss.",
