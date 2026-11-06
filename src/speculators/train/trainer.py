@@ -156,9 +156,65 @@ class TrainerConfig(NamedTuple):
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
+    module_stats_freq: int = 50  # per-module grad/weight/update stats every N steps (only on log steps)
     fsdp_shard: bool = False
     gradient_checkpointing: bool = False
     max_steps: int | None = None
+
+
+def _group_key(name: str) -> str:
+    """Parameter name -> module group (layers.<i>.<attn proj | mlp | norm>, fc, heads...)."""
+    parts = [
+        x for x in name.split(".") if x not in ("module", "_checkpoint_wrapped_module")
+    ]
+    # layers.<i>.<submodule>.<leaf> -> layers.<i>.<submodule>; else drop the leaf
+    if parts and parts[0] == "layers" and len(parts) > 3:
+        return ".".join(parts[:4] if parts[2] in ("self_attn", "mlp") else parts[:3])
+    return ".".join(parts[:-1]) or parts[0]
+
+
+def _group_norms(tensors: dict[str, torch.Tensor]) -> dict[str, float]:
+    """L2 norm of the tensors of each module group. A DTensor shard is gathered, which
+    is a collective: every rank must call this at the same step."""
+    sq: dict[str, torch.Tensor] = {}
+    for name, t in tensors.items():
+        if hasattr(t, "full_tensor"):
+            t = t.full_tensor()
+        key = _group_key(name)
+        sq[key] = sq.get(key, 0.0) + t.detach().float().pow(2).sum()
+    return {k: float(v.sqrt()) for k, v in sq.items()}
+
+
+def _module_grad_norms(model: torch.nn.Module) -> dict[str, float]:
+    """L2 gradient norm per module group; called between backward and clipping."""
+    return _group_norms(
+        {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+    )
+
+
+def _weights_snapshot(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        n: p.detach().clone() for n, p in model.named_parameters() if p.grad is not None
+    }
+
+
+def _update_stats(
+    model: torch.nn.Module,
+    before: dict[str, torch.Tensor],
+    grad_norms: dict[str, float],
+) -> dict[str, dict[str, float]]:
+    """Per module group, after the optimizer step: weight norm, update/weight ratio
+    (||w_after - w_before|| / ||w_after||) and grad/weight ratio (pre-clip gradient)."""
+    params = dict(model.named_parameters())
+    weights = _group_norms({n: params[n] for n in before})
+    updates = _group_norms({n: params[n].detach() - b for n, b in before.items()})
+    return {
+        "param_norm": weights,
+        "update_ratio": {k: updates[k] / max(w, 1e-12) for k, w in weights.items()},
+        "grad_over_param": {
+            k: g / max(weights[k], 1e-12) for k, g in grad_norms.items() if k in weights
+        },
+    }
 
 
 def _resolve_scheduler_steps(
@@ -542,7 +598,15 @@ class Trainer:
             timer.mark("fwd")
             self._optimizers_zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            module_stats = (
+                timer.enabled and self.global_step % self.config.module_stats_freq == 0
+            )
+            if module_stats:
+                grad_norms = _module_grad_norms(self.model)  # before clipping
+                weights_before = _weights_snapshot(self.model)
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), 1.0
+            )
 
             metrics["error_records_sum"] = torch.tensor(
                 batch["error_records"], dtype=torch.float32, device=loss.device
@@ -555,6 +619,9 @@ class Trainer:
 
             timer.mark("bwd")
             self._optimizers_step()
+            if module_stats:
+                update_stats = _update_stats(self.model, weights_before, grad_norms)
+                del weights_before
 
             current_lrs = {
                 type(opt).__name__: opt.param_groups[0]["lr"] for opt in self.optimizers
@@ -578,9 +645,14 @@ class Trainer:
                     if len(current_lrs) > 1
                     else next(iter(current_lrs.values()))
                 )
+                if not module_stats:
+                    grad_norms, update_stats = {}, {}
+                grad_norms["total_preclip"] = float(total_grad_norm)
                 metric_logger.info(
                     {
                         "train": metrics,
+                        "grad_norm": grad_norms,
+                        **update_stats,
                         "profile": profile,
                         "epoch": epoch,
                         "lr": lr_info,
