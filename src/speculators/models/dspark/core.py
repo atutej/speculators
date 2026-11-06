@@ -2,7 +2,9 @@ from collections.abc import Callable
 from typing import ClassVar
 
 import torch
+from torch import nn
 from transformers import PretrainedConfig
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
 from speculators.losses import (
     LossConfig,
@@ -12,10 +14,14 @@ from speculators.losses import (
 )
 from speculators.model import SpeculatorModel
 from speculators.models.dflash.core import DFlashDraftModel
+from speculators.models.dflash.grug_definitions import (
+    GrugDSparkDecoderLayer,
+    partial_rotary_config,
+)
+from speculators.models.utils import conditional_torch_compile, flatten_rope_parameters
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.metrics import compute_metrics
 from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
-from speculators.models.utils import conditional_torch_compile
 
 _DEFAULT_LOSS_CONFIG: LossConfig = {"kl_div": (kl_div_loss, 1.0)}
 
@@ -34,11 +40,31 @@ class DSparkDraftModel(DFlashDraftModel):
     """
 
     config_class: ClassVar[type[DSparkSpeculatorConfig]] = DSparkSpeculatorConfig  # type: ignore[misc,assignment]
+    _no_split_modules = ["Qwen3DFlashDecoderLayer", "GrugDSparkDecoderLayer"]
+
+    def _make_decoder_layer(
+        self, config: DSparkSpeculatorConfig, layer_idx: int
+    ) -> nn.Module:
+        if config.layer_type == "grug":
+            return GrugDSparkDecoderLayer(
+                config.transformer_layer_config,  # type: ignore[arg-type]
+                layer_idx,
+                qk_mult=config.grug_qk_mult,
+                gated_norm_rank=config.grug_gated_norm_rank,
+            )
+        return super()._make_decoder_layer(config, layer_idx)
 
     def __init__(self, config: DSparkSpeculatorConfig) -> None:
         super().__init__(config=config)
 
         hidden_size = config.transformer_layer_config.hidden_size
+
+        if config.layer_type == "grug":
+            self.rotary_emb = Qwen3RotaryEmbedding(
+                partial_rotary_config(  # type: ignore[arg-type]
+                    flatten_rope_parameters(config.transformer_layer_config)  # type: ignore[arg-type]
+                )
+            )
 
         self.markov_head: MarkovHead | None = None
         if config.markov_rank > 0:
@@ -74,6 +100,8 @@ class DSparkDraftModel(DFlashDraftModel):
         confidence_head_with_markov_arg = kwargs.get("confidence_head_with_markov")
         config = DSparkSpeculatorConfig(
             **cls._build_base_config_kwargs("dspark", verifier_config, **kwargs),
+            layer_type=kwargs.get("draft_layer_type") or "qwen3",
+            grug_qk_mult=kwargs.get("grug_qk_mult") or 1.75,
             markov_rank=kwargs.get("markov_rank", 256),
             markov_head_type=kwargs.get("markov_head_type", "vanilla"),
             enable_confidence_head=(
