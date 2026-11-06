@@ -510,6 +510,16 @@ class DFlash2Args(_Group):
 class DSparkArgs(_Group):
     """DSpark-exclusive heads (sequential Markov head + confidence head)."""
 
+    draft_layer_type: Literal["qwen3", "grug"] = Field(
+        default="qwen3",
+        description="DSpark: decoder layer family of the draft backbone "
+        "('grug' mirrors the Grug target layer; full attention only).",
+    )
+    grug_qk_mult: float = Field(
+        default=1.75,
+        gt=0,
+        description="DSpark with --draft-layer-type grug: q scale after q/k RMSNorm.",
+    )
     markov_rank: int = Field(
         default=256,
         description="DSpark: low-rank dim of the Markov logit-bias head "

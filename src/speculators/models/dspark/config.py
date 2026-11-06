@@ -1,9 +1,12 @@
+import logging
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from speculators import SpeculatorModelConfig
 from speculators.models.dflash.config import DFlashSpeculatorConfig
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DSparkSpeculatorConfig",
@@ -37,6 +40,36 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
         ),
     )
 
+    # Draft decoder layer family.
+    layer_type: Literal["qwen3", "grug"] = Field(
+        default="qwen3",
+        description=(
+            "Decoder layer family of the draft backbone. 'qwen3' is the DFlash "
+            "Qwen3 layer. 'grug' is the Grug target's layer (parameter-free q/k norm "
+            "with qk_mult, XSA, per-head output gate, gated norms, shared-expert "
+            "FFN); it always uses full attention."
+        ),
+    )
+    grug_qk_mult: float = Field(
+        default=1.75,
+        gt=0,
+        description="layer_type='grug': q scale applied after the q/k RMSNorm.",
+    )
+    grug_gated_norm_rank: int = Field(
+        default=128,
+        gt=0,
+        description="layer_type='grug': bottleneck rank of the gated norms.",
+    )
+    grug_num_experts: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "layer_type='grug': routed experts per FFN. 0 keeps only the shared "
+            "expert (a dense FFN of width transformer_layer_config.intermediate_size); "
+            "routed experts are not implemented yet."
+        ),
+    )
+
     # Sequential (Markov) head.
     markov_rank: int = Field(
         default=256,
@@ -65,3 +98,25 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "hidden state as the confidence-head input."
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_grug_layers(self) -> "DSparkSpeculatorConfig":
+        if self.layer_type != "grug":
+            return self
+        if self.grug_num_experts != 0:
+            raise ValueError("grug_num_experts > 0 (routed experts) is not implemented")
+        layer_types = getattr(self.transformer_layer_config, "layer_types", None)
+        if layer_types and "sliding_attention" in layer_types:
+            raise ValueError("layer_type='grug' supports full attention layers only")
+        rope_parameters = getattr(
+            self.transformer_layer_config, "rope_parameters", None
+        )
+        if (rope_parameters or {}).get("partial_rotary_factor") is None:
+            logger.warning(
+                "layer_type='grug' without `partial_rotary_factor` in the draft "
+                "config's rope_parameters uses full RoPE. The Grug target rotates "
+                "half of each head's dims (0.5) on its windowed layers. Pass "
+                "--draft-config with `partial_rotary_factor` set; the auto-built "
+                "draft config drops it."
+            )
+        return self
